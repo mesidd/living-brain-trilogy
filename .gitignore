@@ -1,0 +1,15 @@
+# Node
+node_modules/
+.next/
+dist/
+
+# Python
+venv/
+__pycache__/
+*.pyc
+
+# OS
+.DS_Store
+
+# ChromaDB cache
+backend/chroma_db/

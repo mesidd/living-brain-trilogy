@@ -8,14 +8,25 @@ from fastapi import UploadFile, File
 from langchain_community.document_loaders import PyPDFLoader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_chroma import Chroma
-from langchain_community.embeddings import OllamaEmbeddings
+
+# Teaching the AI to Use Its Memory (RAG)
+from langchain.chains import create_retrieval_chain
+from langchain.chains.combine_documents import create_stuff_documents_chain
+from langchain_core.prompts import ChatPromptTemplate
 
 from pathlib import Path
 from langchain_community.document_loaders import PyPDFLoader, TextLoader
 
-# # Create an instance of the FastAPI class
-app = FastAPI()
+from langchain_ollama import OllamaEmbeddings, OllamaLLM
 
+
+from langchain_neo4j import GraphCypherQAChain, Neo4jGraph
+from langchain_core.prompts import PromptTemplate
+import os
+
+
+# Create an instance of the FastAPI class
+app = FastAPI()
 
 origins = [
     "http://localhost:3000",  # The address of our Next.js frontend
@@ -29,6 +40,17 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Neo4j Connection Details
+NEO4J_URI = "bolt://localhost:7687"
+NEO4J_USERNAME = "neo4j"
+NEO4J_PASSWORD = "brain@1234"
+
+graph = Neo4jGraph(
+    url=NEO4J_URI, 
+    username=NEO4J_USERNAME, 
+    password=NEO4J_PASSWORD
+)
+
 # Define the request body model for our endpoint
 class PromptRequest(BaseModel):
     prompt: str
@@ -38,35 +60,56 @@ class PromptRequest(BaseModel):
 def read_root():
     return {"message": "Welcome to the Living Brain API"}
 
-# Define the AI prompt endpoint
+
 @app.post("/api/prompt")
 async def generate_response(request: PromptRequest):
-    # The URL for the Ollama API
-    ollama_url = "http://localhost:11434/api/generate"
+    # --- Vector RAG (what we had before) ---
+    embeddings = OllamaEmbeddings(model="llama3:8b")
+    vectorstore = Chroma(persist_directory="./chroma_db", embedding_function=embeddings)
+    retriever = vectorstore.as_retriever()
+    
+    # --- Graph RAG ---
+    # We will use the graph to answer questions about relationships
+    llm = OllamaLLM(model="llama3:8b")
+    
+    # This chain will specifically query the knowledge graph
+    graph_chain = GraphCypherQAChain.from_llm(
+        graph=graph, 
+        llm=llm, 
+        allow_dangerous_requests=True,
+        verbose=True # Set to True to see the generated Cypher queries in your terminal
+    )
 
-    # The data payload to send to Ollama
-    payload = {
-        "model": "llama3:8b",
-        "prompt": request.prompt,
-        "stream": False  # We'll get the full response at once
-    }
-
-    try:
-        # Make the POST request to the Ollama server
-        response = requests.post(ollama_url, json=payload)
-        
-        # Raise an exception if the request was unsuccessful
-        response.raise_for_status()
-
-        # Parse the JSON response from Ollama
-        data = response.json()
-        
-        # Return the 'response' field from the Ollama output
-        return {"response": data.get("response")}
-
-    except requests.exceptions.RequestException as e:
-        # Handle connection errors or other request issues
-        return {"error": f"Failed to connect to Ollama: {e}"}
+    # --- The Decider ---
+    # We'll use a simple logic: if the question is about relationships, use the graph.
+    # Otherwise, use the vector store. A more advanced system could use an LLM to decide.
+    relationship_keywords = ["relationship", "connect", "link", "between", "how does"]
+    
+    if any(keyword in request.prompt.lower() for keyword in relationship_keywords):
+        print("--- Using Knowledge Graph to answer ---")
+        # Use the GraphCypherQAChain for questions about relationships
+        result = graph_chain.invoke({"query": request.prompt})
+        return {"response": result.get("result")}
+    else:
+        print("--- Using Vector Store to answer ---")
+        # Use the standard RAG chain for other questions
+        system_prompt = (
+            "You are an intelligent assistant. Use the following context to "
+            "answer the user's question. If you don't know the answer, say you "
+            "don't know."
+            "\n\n"
+            "{context}"
+        )
+        prompt_template = ChatPromptTemplate.from_messages(
+            [
+                ("system", system_prompt),
+                ("human", "{input}"),
+            ]
+        )
+        question_answer_chain = create_stuff_documents_chain(llm, prompt_template)
+        retrieval_chain = create_retrieval_chain(retriever, question_answer_chain)
+        response = retrieval_chain.invoke({"input": request.prompt})
+        return {"response": response.get("answer")}
 
 # Ingest Document
 @app.post("/api/ingest")
@@ -75,6 +118,7 @@ async def ingest_document(file: UploadFile = File(...)):
     file_path = f"./data/{file.filename}"
     with open(file_path, "wb") as buffer:
         buffer.write(await file.read())
+
 
     ext = Path(file.filename).suffix.lower()
     print(f"Ingesting document: {file.filename}")
@@ -102,7 +146,58 @@ async def ingest_document(file: UploadFile = File(...)):
         embedding=embeddings,
         persist_directory="./chroma_db"
     )
+    print(f"Successfully ingested {len(splits)} chunks into ChromaDB.")
+    # print(f"Successfully ingested {len(splits)} chunks.")
 
-    print(f"Successfully ingested {len(splits)} chunks.")
+    # --- NEW: Graph Extraction Section ---
+    print("Extracting entities and relationships for the knowledge graph...")
 
-    return {"status": "success", "filename": file.filename, "chunks": len(splits)}
+    # We will use a specific LLM for graph extraction
+    graph_extraction_llm = OllamaLLM(model="llama3:8b")
+
+   # A prompt to instruct the LLM to extract triples
+    extraction_prompt = PromptTemplate.from_template(
+        "You are an expert at extracting information. From the following text, "
+        "extract entities and relationships as a list of triples. "
+        "Format each triple as (Head, RELATION, Tail). "
+        "Example: (Marie Curie, FOUND, Radium). "
+        "Do not add any explanation or preamble. Just provide the list of triples.\n\n"
+        "Text: '''{text}'''"
+    )
+
+    # We'll process the document in larger chunks for better context
+    combined_text = " ".join([doc.page_content for doc in documents])
+
+    # Generate the triples
+    formatted_prompt = extraction_prompt.format(text=combined_text)
+    extracted_triples_str = await graph_extraction_llm.ainvoke(formatted_prompt)
+
+    # Parse the string response into a list of tuples
+    # This is a simple parser, can be improved for robustness
+    triples = []
+
+    for chunk in splits:
+        prompt_text = extraction_prompt.format(text=chunk.page_content)
+        chunk_triples_str = await graph_extraction_llm.ainvoke(prompt_text)
+        
+        # Original
+        for line in extracted_triples_str.strip().split('\n'):
+            try:
+                head, rel, tail = line.strip().strip('()').split(', ')
+                triples.append((head.strip(), rel.strip(), tail.strip()))
+            except ValueError:
+                continue # Skip malformed lines
+
+    # Add to Neo4j graph
+    for head, rel, tail in triples:
+        graph.query(
+            "MERGE (h:`Entity` {name: $head}) "
+            "MERGE (t:`Entity` {name: $tail}) "
+            "MERGE (h)-[:`" + rel.replace(" ", "_").upper() + "`]->(t)",
+            params={'head': head, 'tail': tail}
+        )
+    
+    print(f"Successfully added {len(triples)} relationships to the knowledge graph.")
+
+    # return {"status": "success", "filename": file.filename, "chunks": len(splits)}
+    # return {"status": "success", "filename": file.filename, "chunks": len(splits), "triples": len(triples)}

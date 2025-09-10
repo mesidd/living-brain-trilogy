@@ -24,6 +24,12 @@ from langchain_neo4j import GraphCypherQAChain, Neo4jGraph
 from langchain_core.prompts import PromptTemplate
 import os
 
+from dotenv import load_dotenv
+
+from fastapi import Form
+
+load_dotenv()
+
 
 # Create an instance of the FastAPI class
 app = FastAPI()
@@ -41,9 +47,10 @@ app.add_middleware(
 )
 
 # Neo4j Connection Details
-NEO4J_URI = "bolt://localhost:7687"
-NEO4J_USERNAME = "neo4j"
-NEO4J_PASSWORD = "brain@1234"
+NEO4J_URI = os.getenv("NEO4J_URI")
+NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD")
+NEO4J_USERNAME = os.getenv("NEO4J_USERNAME")
+
 
 graph = Neo4jGraph(
     url=NEO4J_URI, 
@@ -113,25 +120,19 @@ async def generate_response(request: PromptRequest):
 
 # Ingest Document
 @app.post("/api/ingest")
-async def ingest_document(file: UploadFile = File(...)):
+async def ingest_document(label: str = Form(...),
+    file: UploadFile = File(...)):
     # Save the uploaded file temporarily
     file_path = f"./data/{file.filename}"
     with open(file_path, "wb") as buffer:
         buffer.write(await file.read())
 
-
     ext = Path(file.filename).suffix.lower()
     print(f"Ingesting document: {file.filename}")
 
-    if ext == ".pdf":
-        loader = PyPDFLoader(file_path)
-    elif ext == ".txt":
-        loader = TextLoader(file_path, encoding="utf-8")
-    else:
-        return {"status": "error", "message": f"Unsupported file type: {ext}"}
-
     # 1. Load the document
-    # loader = PyPDFLoader(file_path)
+    loader = PyPDFLoader(file_path) if file.filename.endswith(".pdf") else TextLoader(file_path)
+
     documents = loader.load()
 
     # 2. Split the document into chunks
@@ -150,7 +151,7 @@ async def ingest_document(file: UploadFile = File(...)):
     # print(f"Successfully ingested {len(splits)} chunks.")
 
     # --- NEW: Graph Extraction Section ---
-    print("Extracting entities and relationships for the knowledge graph...")
+    print(f"Extracting entities and relationships for the {label} graph...")
 
     # We will use a specific LLM for graph extraction
     graph_extraction_llm = OllamaLLM(model="llama3:8b")
@@ -191,13 +192,12 @@ async def ingest_document(file: UploadFile = File(...)):
     # Add to Neo4j graph
     for head, rel, tail in triples:
         graph.query(
-            "MERGE (h:`Entity` {name: $head}) "
-            "MERGE (t:`Entity` {name: $tail}) "
+            "MERGE (h:`Entity`:`" + label.capitalize() + "` {name: $head}) "
+            "MERGE (t:`Entity`:`" + label.capitalize() + "` {name: $tail}) "
             "MERGE (h)-[:`" + rel.replace(" ", "_").upper() + "`]->(t)",
             params={'head': head, 'tail': tail}
         )
     
-    print(f"Successfully added {len(triples)} relationships to the knowledge graph.")
+    print(f"Successfully added {len(triples)} relationships to the knowledge graph under the {label}.")
 
-    # return {"status": "success", "filename": file.filename, "chunks": len(splits)}
-    # return {"status": "success", "filename": file.filename, "chunks": len(splits), "triples": len(triples)}
+    return {"status": "success", "filename": file.filename, "label": label, "chunks": len(splits), "triples": len(triples)}

@@ -13,3 +13,6 @@ __pycache__/
 
 # ChromaDB cache
 backend/chroma_db/
+
+#env file
+.env

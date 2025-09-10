@@ -264,3 +264,65 @@ async def synthesize_topics(request: SynthesizeRequest):
     print(f"Synthesis generated: {synthesis}")
 
     return {"thesis": thesis_context, "antithesis": antithesis_context, "conflict": conflict, "synthesis": synthesis}
+
+@app.post("/api/find_analogy")
+async def find_analogy():
+    # --- Step 1: Find the most central "hub" node in each domain ---
+    # We use the APOC procedure 'apoc.degree' to calculate the number of connections for each node.
+
+    domain_a_label = "Pen"
+    domain_b_label = "Apple"
+
+    # Query for the hub of Domain A
+    hub_a_query = f"""
+    MATCH (n:{domain_a_label})
+    RETURN n.name AS hub, apoc.node.degree(n) AS degree
+    ORDER BY degree DESC
+    LIMIT 1
+    """
+
+    # Query for the hub of Domain B
+    hub_b_query = f"""
+    MATCH (n:{domain_b_label})
+    RETURN n.name AS hub, apoc.node.degree(n) AS degree
+    ORDER BY degree DESC
+    LIMIT 1
+    """
+
+    hub_a_result = graph.query(hub_a_query)
+    hub_b_result = graph.query(hub_b_query)
+
+    hub_a = hub_a_result[0]['hub'] if hub_a_result else None
+    hub_b = hub_b_result[0]['hub'] if hub_b_result else None
+
+    if not hub_a or not hub_b:
+        return {"error": "Could not find central hub concepts in one or both domains."}
+
+    print(f"Found structural analogs: '{hub_a}' (Domain A) and '{hub_b}' (Domain B)")
+
+    # --- Step 2: The "Metaphorical Prompt" ---
+    # This is where we ask the LLM to make the creative leap.
+    
+    analogy_prompt = PromptTemplate.from_template(
+        "You are a creative genius, a polymath in the style of Leonardo da Vinci. "
+        "Your task is to find a deep, insightful analogy between two seemingly unrelated concepts.\n\n"
+        "In the domain of {domain_a}, the concept '{hub_a}' is a central 'hub' with many connections.\n"
+        "In the domain of {domain_b}, the concept '{hub_b}' is also a central 'hub' with many connections.\n\n"
+        "Based on this structural parallel, generate a creative and illuminating analogy. "
+        "Explore the question: 'What can {domain_b} learn from {domain_a}?' "
+        "Explain the parallels and draw out novel insights. Do not just state the connection, elaborate on it."
+    )
+
+    llm = OllamaLLM(model="llama3:8b")
+    analogy_chain = analogy_prompt | llm
+
+    print("--- Generating creative analogy... ---")
+    analogy = await analogy_chain.ainvoke({
+        "domain_a": domain_a_label,
+        "hub_a": hub_a,
+        "domain_b": domain_b_label,
+        "hub_b": hub_b
+    })
+
+    print("--- Analogy generated ---")
+    return {"hub_a": hub_a, "hub_b": hub_b, "analogy": analogy}

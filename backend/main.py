@@ -62,6 +62,9 @@ graph = Neo4jGraph(
 class PromptRequest(BaseModel):
     prompt: str
 
+class SynthesizeRequest(BaseModel):
+    topic: str
+
 # Define the root endpoint
 @app.get("/")
 def read_root():
@@ -201,3 +204,64 @@ async def ingest_document(label: str = Form(...),
     print(f"Successfully added {len(triples)} relationships to the knowledge graph under the {label}.")
 
     return {"status": "success", "filename": file.filename, "label": label, "chunks": len(splits), "triples": len(triples)}
+
+
+@app.post("/api/synthesize")
+async def synthesize_topics(request: SynthesizeRequest):
+    print(f"--- Starting synthesis for topic: {request.topic} ---")
+
+    # 1. Pull ALL knowledge from both sides of the graph
+    # This is more robust as it doesn't depend on a topic keyword match.
+    
+    thesis_query = "MATCH (n:Thesis)-[r]->(m:Thesis) RETURN n.name AS head, type(r) AS relation, m.name AS tail LIMIT 25"
+    thesis_results = graph.query(thesis_query)
+    thesis_triples = [f"({r['head']}, {r['relation']}, {r['tail']})" for r in thesis_results]
+    thesis_context = "\n".join(thesis_triples)
+
+    antithesis_query = "MATCH (n:Antithesis)-[r]->(m:Antithesis) RETURN n.name AS head, type(r) AS relation, m.name AS tail LIMIT 25"
+    antithesis_results = graph.query(antithesis_query)
+    antithesis_triples = [f"({r['head']}, {r['relation']}, {r['tail']})" for r in antithesis_results]
+    antithesis_context = "\n".join(antithesis_triples)
+
+    print(f"Found {len(thesis_triples)} thesis points and {len(antithesis_triples)} antithesis points.")
+    
+    # Check if we actually found any data
+    if not thesis_context or not antithesis_context:
+        return {"error": "Could not find sufficient thesis or antithesis data in the graph to perform synthesis."}
+
+    # 2. First LLM Call: Identify the core conflict (this part is the same)
+    conflict_prompt = PromptTemplate.from_template(
+        "You are a master debater and analyst. Below are two opposing sets of ideas, a Thesis and an Antithesis, presented as knowledge graph triples.\n\n"
+        "Thesis:\n{thesis_context}\n\n"
+        "Antithesis:\n{antithesis_context}\n\n"
+        "Your task is to analyze both viewpoints and identify the 2-3 core points of tension or fundamental disagreement between them. Summarize this conflict clearly and concisely."
+    )
+    llm = OllamaLLM(model="llama3:8b")
+    conflict_chain = conflict_prompt | llm
+    print("--- Identifying conflict... ---")
+    conflict = await conflict_chain.ainvoke({
+        "thesis_context": thesis_context, 
+        "antithesis_context": antithesis_context
+    })
+    print(f"Conflict identified: {conflict}")
+
+    # 3. Second LLM Call: Generate the synthesis (this part is the same)
+    synthesis_prompt = PromptTemplate.from_template(
+        "You are a visionary philosopher. You have been presented with two opposing viewpoints (a Thesis and an Antithesis) and an analysis of their core conflict.\n\n"
+        "Thesis triples:\n{thesis_context}\n\n"
+        "Antithesis triples:\n{antithesis_context}\n\n"
+        "Core Conflict:\n{conflict}\n\n"
+        "Your task is to generate a 'Synthesis' - a new, higher-level perspective that resolves, integrates, or transcends this conflict. "
+        "The synthesis should not simply pick a side, but create a more nuanced understanding of the topic: '{topic}'."
+    )
+    synthesis_chain = synthesis_prompt | llm
+    print("--- Generating synthesis... ---")
+    synthesis = await synthesis_chain.ainvoke({
+        "thesis_context": thesis_context,
+        "antithesis_context": antithesis_context,
+        "conflict": conflict,
+        "topic": request.topic
+    })
+    print(f"Synthesis generated: {synthesis}")
+
+    return {"thesis": thesis_context, "antithesis": antithesis_context, "conflict": conflict, "synthesis": synthesis}

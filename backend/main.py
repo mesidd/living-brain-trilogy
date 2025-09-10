@@ -35,7 +35,7 @@ load_dotenv()
 app = FastAPI()
 
 origins = [
-    "http://localhost:3000",  # The address of our Next.js frontend
+    "http://localhost:3000",
 ]
 
 app.add_middleware(
@@ -211,7 +211,6 @@ async def synthesize_topics(request: SynthesizeRequest):
     print(f"--- Starting synthesis for topic: {request.topic} ---")
 
     # 1. Pull ALL knowledge from both sides of the graph
-    # This is more robust as it doesn't depend on a topic keyword match.
     
     thesis_query = "MATCH (n:Thesis)-[r]->(m:Thesis) RETURN n.name AS head, type(r) AS relation, m.name AS tail LIMIT 25"
     thesis_results = graph.query(thesis_query)
